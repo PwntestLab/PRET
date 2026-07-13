@@ -1,5 +1,8 @@
 ## PRET - Printer Exploitation Toolkit
 
+> [!NOTE]
+> This fork adds a `rawput` command to PJL mode (`rawput <local file> [remote path] [port]`). It uploads a file over a plain socket instead of PRET's normal framed `put`, for cases where the UEL/status/echo wrapper interferes with path traversal or unusual volume names. After the upload, `rawput` waits briefly and then reconnects automatically to ensure the device flushes the write to disk. See [Commands in PJL mode](#commands-in-pjl-mode) for details.
+
 **Is your printer secure? Check before someone else does...**
 
 PRET is a new tool for printer security testing developed in the scope of a [Master's Thesis](http://nds.rub.de/media/ei/arbeiten/2017/01/13/exploiting-printers.pdf) at Ruhr University Bochum. It connects to a device via network or USB and exploits the features of a given printer language. Currently [PostScript](https://www.adobe.com/products/postscript/pdfs/PLRM.pdf), [PJL](http://h10032.www1.hp.com/ctg/Manual/bpl13208.pdf) and [PCL](http://www.hp.com/ctg/Manual/bpl13210.pdf) are supported which are spoken by most laser printers. This allows cool stuff like capturing or manipulating print jobs, accessing the printer's file system and memory or even causing physical damage to the device. All attacks are documented in detail in the [Hacking Printers Wiki](http://hacking-printers.net/wiki/).
@@ -147,6 +150,7 @@ Generic file system operations with a PS/PJL/PCL specific implementation are:
 │ ls        │  ✓  │  ✓  │  ✓  │ List contents of remote directory.     │
 │ get       │  ✓  │  ✓  │  ✓  │ Receive file: get <file>               │
 │ put       │  ✓  │  ✓  │  ✓  │ Send file: put <local file>            │
+│ rawput    │     │  ✓  │     │ Send file via raw socket: rawput <file>│
 │ append    │  ✓  │  ✓  │     │ Append to file: append <file> <str>    │
 │ delete    │  ✓  │  ✓  │  ✓  │ Delete remote file: delete <file>      │
 │ rename    │  ✓  │     │     │ Rename remote file: rename <old> <new> │
@@ -249,6 +253,9 @@ nvram      NVRAM operations:  nvram <operation>
   nvram read addr            - Read single byte from address.
   nvram write addr value     - Write single byte to address.
 
+rawput     Upload file via raw socket, bypassing PRET's UEL wrapper:
+             rawput <local file> [remote path] [port]
+
 info       Show information:  info <category>
   info config      - Provides configuration information.
   info filesys     - Returns PJL file system information.
@@ -261,6 +268,19 @@ info       Show information:  info <category>
 ```
 
 Some commands are supported exclusively by HP printers, because other vendors have only implemented a subset of the PJL standard. This is especially true for PML based commands like `restart`or `reset`. Enabling long-term job retention via the `hold` command seems to be possible for some Epson devices only. NVRAM access via the `nvram` command is a proprietary feature of Brother printers. Limited access to the file system is supported by various HP, OKI, Konica, Xerox, Epson and Ricoh devices.
+
+`rawput` is a variant of `put` for cases where the regular file upload gets in the way of itself. The normal `put` command wraps every transfer in PRET's own framing (UEL header/footer, optional status query, echo delimiter) so it can detect success/failure and keep the session in sync. On some devices that framing interferes with `FSDOWNLOAD` requests that use unusual volume names or traversal sequences in the target path. `rawput` opens a plain TCP connection to the printer's port 9100 and sends a bare `@PJL FSDOWNLOAD` command followed directly by the file data — no status checks, no echo confirmation, just the minimum PJL needed to write the file. Paths use forward slashes, e.g. `0:../../../foo`, not backslashes.
+
+After the upload, `rawput` waits ~1.5 seconds for the device to process the write, then reconnects the main session so the printer can flush the data to persistent storage while idle.
+
+    laserjet.lan:/> rawput payload.bin 0:../../../foo
+    [+] Sent 1337 bytes via raw socket to 192.168.1.5:9100
+    Flushing write to disk (waiting for device)...
+    Connection closed.
+    Connection to 127.0.0.1 established
+    File uploaded. Verify with: get 0:../../../foo
+
+Usage: `rawput <local file> [remote path] [port]`. If `remote path` is omitted, the local filename is used; `port` defaults to 9100. If the reconnect fails or commands time out afterward, you can manually run `reconnect` to try again.
 
 ### Commands in PCL mode
 
